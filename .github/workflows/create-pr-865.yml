@@ -1,0 +1,73 @@
+name: Create upstream PR for #865
+
+on:
+  push:
+    branches:
+      - ops/create-pr-865
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create upstream pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/pr-body.md" <<'EOF'
+          Supersedes #867 after the runtime migration. Fixes #865.
+
+          This re-cuts the spill recovery against the current runtime versions, following the maintainer review on #867.
+
+          ## What changed
+
+          - Extend the existing stable `patches/dsh-subprocess-local@0.1.5-rc.2.patch`.
+            - Spill code is in `lib/runner-launch-COYGu0Dl.js`.
+            - The existing `ELECTRON_RUN_AS_NODE` hunk is preserved.
+          - Extend the existing beta `patches/dsh-subprocess-local@0.1.6-alpha.2.patch`.
+            - The existing Electron hunk remains in `lib/runner-launch-DGV26RBf.js`.
+            - The actual beta spill implementation was confirmed from the vendored tarball to be `lib/output.js`.
+          - On the first spill-open failure:
+            - best-effort close/unlink any partial fd/file;
+            - recreate the owned spill directory only for `ENOENT` with mode `0700`;
+            - retry exactly once with a fresh random spill filename;
+            - degrade to the in-memory tail if recreation/retry fails or if the original error is not `ENOENT`.
+          - Post-open spill write failures discard spilling instead of escaping into the host process.
+          - Preserve `wx` / O_EXCL semantics, `0600` spill-file mode, random suffixes, and per-stream stdout/stderr spill separation.
+          - Restore the version-independent `tests/subprocess-spill-recovery.spec.ts` coverage for both stable and beta desktop workspaces.
+
+          ## Validation
+
+          Re-cut and validated from `master` at `535259b83400b98fb13ce5f64be09a45c19fbca9`:
+
+          - `node scripts/sync-vendored-runtime.mjs --write --channel stable`
+          - `node scripts/sync-vendored-runtime.mjs --write --channel beta`
+          - lockfile updated for the new patch hashes, followed by an immutable reinstall
+          - `yarn check:vendored-runtime`
+            - stable: 265 packages verified
+            - beta: 293 packages verified
+          - stable spill-recovery regression: 6/6 passed
+          - beta spill-recovery regression: 6/6 passed
+          - `yarn workspace dsh-plugin-desktop typecheck`
+          - `yarn workspace dsh-plugin-desktop-beta typecheck`
+          - `git diff --check`
+
+          Independent Windows validation also reproduced #865 on the pre-fix runtime and then reran the same delete-then-spill scenario against this candidate, confirming that the host no longer crashes and spill recovery succeeds. The stable regression was also checked with a negative control to confirm it is not a false-positive test.
+
+          A secondary local desktop-runtime-environment test had three failures caused by local symlink permissions; those failures were confirmed to have zero diff overlap with this PR.
+
+          The regression suite includes the deterministic delete-then-spill path from #865, repeated deletion recovery, normal spill behavior, non-ENOENT fallback behavior, and the in-memory fallback when the spill directory cannot be recreated.
+          EOF
+
+          gh pr create \
+            --repo anywhere-labs/dsh-desktop \
+            --base master \
+            --head Bruce-Yii:fix/865-spill-recovery-runtime-recut \
+            --title "fix(desktop): recover subprocess spill writes after external temp directory deletion" \
+            --body-file "$RUNNER_TEMP/pr-body.md"
