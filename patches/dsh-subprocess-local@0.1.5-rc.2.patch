@@ -1,7 +1,75 @@
 diff --git a/lib/runner-launch-COYGu0Dl.js b/lib/runner-launch-COYGu0Dl.js
 --- a/lib/runner-launch-COYGu0Dl.js
 +++ b/lib/runner-launch-COYGu0Dl.js
-@@ -1449,6 +1449,14 @@
+@@ -1,4 +1,4 @@
+-import { accessSync, chmodSync, closeSync, constants, existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
++import { accessSync, chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+ import { basename, dirname, extname, isAbsolute, join } from "node:path";
+ import { scrubbedParentEnv } from "@deepseek-ai/dsh-subprocess";
+ import { execFileSync, spawn, spawnSync } from "node:child_process";
+@@ -762,11 +762,57 @@
+ 			return;
+ 		}
+ 		if (this.spillFd === void 0) {
+-			this.spillFile = join(this.spillDir, `dsh-subprocess-${process.pid}-${++spillCounter}-${randomBytes(6).toString("hex")}-${this.label}.log`);
+-			this.spillFd = openSync(this.spillFile, "wx", 384);
+-			for (const prior of this.chunks) writeSync(this.spillFd, prior);
++			try {
++				this.spillFile = join(this.spillDir, `dsh-subprocess-${process.pid}-${++spillCounter}-${randomBytes(6).toString("hex")}-${this.label}.log`);
++				this.spillFd = openSync(this.spillFile, "wx", 384);
++				for (const prior of this.chunks) writeSync(this.spillFd, prior);
++			} catch (error) {
++				const fd = this.spillFd;
++				const file = this.spillFile;
++				this.spillFd = void 0;
++				this.spillFile = void 0;
++				if (fd !== void 0) try {
++					closeSync(fd);
++				} catch {}
++				if (file !== void 0) try {
++					unlinkSync(file);
++				} catch {}
++				if (error?.code !== "ENOENT") {
++					this.spillDisabled = true;
++					return;
++				}
++				try {
++					mkdirSync(this.spillDir, { recursive: true, mode: 448 });
++				} catch {
++					this.spillDisabled = true;
++					return;
++				}
++				try {
++					this.spillFile = join(this.spillDir, `dsh-subprocess-${process.pid}-${++spillCounter}-${randomBytes(6).toString("hex")}-${this.label}.log`);
++					this.spillFd = openSync(this.spillFile, "wx", 384);
++					for (const prior of this.chunks) writeSync(this.spillFd, prior);
++				} catch {
++					const retryFd = this.spillFd;
++					const retryFile = this.spillFile;
++					this.spillFd = void 0;
++					this.spillFile = void 0;
++					this.spillDisabled = true;
++					if (retryFd !== void 0) try {
++						closeSync(retryFd);
++					} catch {}
++					if (retryFile !== void 0) try {
++						unlinkSync(retryFile);
++					} catch {}
++					return;
++				}
++			}
++		}
++		try {
++			writeSync(this.spillFd, chunk);
++		} catch {
++			this.discardSpill();
++			return;
+ 		}
+-		writeSync(this.spillFd, chunk);
+ 	}
+ 	/** Stop spilling and remove the file once it can no longer hold the complete stream. */
+ 	discardSpill() {
+@@ -1449,6 +1495,14 @@
  		const normalized = name.toUpperCase();
  		if (RUNNER_CONTROL_ENV_PREFIXES.some((prefix) => normalized.startsWith(prefix))) Reflect.deleteProperty(env, name);
  	}

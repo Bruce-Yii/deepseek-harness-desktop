@@ -1,8 +1,7 @@
 diff --git a/lib/runner-launch-DGV26RBf.js b/lib/runner-launch-DGV26RBf.js
-index 4ee7d40..e19787b 100644
 --- a/lib/runner-launch-DGV26RBf.js
 +++ b/lib/runner-launch-DGV26RBf.js
-@@ -1343,6 +1343,14 @@ function runnerEnvironment(selection, invocation) {
+@@ -1343,6 +1343,14 @@
  		const normalized = name.toUpperCase();
  		if (RUNNER_CONTROL_ENV_PREFIXES.some((prefix) => normalized.startsWith(prefix))) Reflect.deleteProperty(env, name);
  	}
@@ -17,3 +16,74 @@ index 4ee7d40..e19787b 100644
  	return {
  		...env,
  		[SUBPROCESS_RUNNER_ENV]: selection,
+diff --git a/lib/output.js b/lib/output.js
+--- a/lib/output.js
++++ b/lib/output.js
+@@ -1,4 +1,4 @@
+-import { closeSync, mkdtempSync, openSync, rmdirSync, unlinkSync, writeSync } from "node:fs";
++import { closeSync, mkdirSync, mkdtempSync, openSync, rmdirSync, unlinkSync, writeSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { randomBytes } from "node:crypto";
+@@ -97,11 +97,57 @@
+ 			return;
+ 		}
+ 		if (this.spillFd === void 0) {
+-			this.spillFile = join(this.spillDir, `dsh-subprocess-${process.pid}-${++spillCounter}-${randomBytes(6).toString("hex")}-${this.label}.log`);
+-			this.spillFd = openSync(this.spillFile, "wx", 384);
+-			for (const prior of this.chunks) writeSync(this.spillFd, prior);
++			try {
++				this.spillFile = join(this.spillDir, `dsh-subprocess-${process.pid}-${++spillCounter}-${randomBytes(6).toString("hex")}-${this.label}.log`);
++				this.spillFd = openSync(this.spillFile, "wx", 384);
++				for (const prior of this.chunks) writeSync(this.spillFd, prior);
++			} catch (error) {
++				const fd = this.spillFd;
++				const file = this.spillFile;
++				this.spillFd = void 0;
++				this.spillFile = void 0;
++				if (fd !== void 0) try {
++					closeSync(fd);
++				} catch {}
++				if (file !== void 0) try {
++					unlinkSync(file);
++				} catch {}
++				if (error?.code !== "ENOENT") {
++					this.spillDisabled = true;
++					return;
++				}
++				try {
++					mkdirSync(this.spillDir, { recursive: true, mode: 448 });
++				} catch {
++					this.spillDisabled = true;
++					return;
++				}
++				try {
++					this.spillFile = join(this.spillDir, `dsh-subprocess-${process.pid}-${++spillCounter}-${randomBytes(6).toString("hex")}-${this.label}.log`);
++					this.spillFd = openSync(this.spillFile, "wx", 384);
++					for (const prior of this.chunks) writeSync(this.spillFd, prior);
++				} catch {
++					const retryFd = this.spillFd;
++					const retryFile = this.spillFile;
++					this.spillFd = void 0;
++					this.spillFile = void 0;
++					this.spillDisabled = true;
++					if (retryFd !== void 0) try {
++						closeSync(retryFd);
++					} catch {}
++					if (retryFile !== void 0) try {
++						unlinkSync(retryFile);
++					} catch {}
++					return;
++				}
++			}
++		}
++		try {
++			writeSync(this.spillFd, chunk);
++		} catch {
++			this.discardSpill();
++			return;
+ 		}
+-		writeSync(this.spillFd, chunk);
+ 	}
+ 	/** Stop spilling and remove the file once it can no longer hold the complete stream. */
+ 	discardSpill() {
