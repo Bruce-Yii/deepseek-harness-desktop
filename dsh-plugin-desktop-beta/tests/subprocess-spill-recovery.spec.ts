@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
@@ -169,6 +169,66 @@ describe('subprocess spill recovery after external temp deletion (#865)', () => 
     } finally {
       await dispose();
       rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('discards the spill when a post-open write fails (#1049)', async () => {
+    // Deterministic post-open write-failure seam: open the spill with a first
+    // gated write, invalidate the ACTIVE spill fd out-of-band (closeSync makes
+    // the next writeSync throw EBADF on every platform — no chmod/disk tricks),
+    // then release a second write. The pre-close assertions prove the spill
+    // had already opened, so a pass cannot silently exercise the open/retry
+    // path instead.
+    const spillDir = mkdtempSync(join(tmpdir(), 'dsh-1049-postopen-'));
+    const goFile = join(spillDir, 'release-second-write');
+    const script = [
+      `const fs = require('node:fs');`,
+      `const go = ${JSON.stringify(goFile)};`,
+      `process.stdout.write('x'.repeat(5000));`,
+      `const wait = () => {`,
+      `  if (fs.existsSync(go)) { process.stdout.write('y'.repeat(5000)); }`,
+      `  else { setTimeout(wait, 10); }`,
+      `};`,
+      `wait();`,
+    ].join('\n');
+    const { service, dispose } = await bootSpillService(spillDir);
+    try {
+      const running = service.spawn({
+        argv: [process.execPath, '-e', script],
+        cwd: process.cwd(),
+        stdio: {
+          stdin: 'ignore',
+          stdout: { maxBytes: 64, spill: { maxBytes: 64 * 1024 * 1024 } },
+          stderr: { maxBytes: 64 },
+        },
+        graceMs: 5_000,
+      });
+      const collector = running.collected.stdout;
+      expect(collector).toBeDefined();
+      let spillPath0: string | undefined;
+      const deadline = Date.now() + 20_000;
+      for (;;) {
+        spillPath0 = collector?.readFrom(0).spillPath;
+        if (spillPath0 !== undefined && existsSync(spillPath0)) break;
+        expect(Date.now()).toBeLessThan(deadline);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(spillPath0).toBeDefined();
+      const active = collector as unknown as { spillFd?: unknown };
+      expect(typeof active.spillFd).toBe('number');
+      closeSync(active.spillFd as number);
+      writeFileSync(goFile, 'go');
+      const outcome = await running.done;
+      expect(outcome.exitCode).toBe(0);
+      const out = collector?.readFrom(0);
+      expect(out?.spillPath).toBeUndefined();
+      expect(out?.text).toBe('y'.repeat(64));
+      expect(out?.lossy).toBe(true);
+      expect(existsSync(spillPath0 ?? '')).toBe(false);
+      expect(readdirSync(spillDir).filter((name) => name.endsWith('.log'))).toEqual([]);
+    } finally {
+      await dispose();
+      rmSync(spillDir, { recursive: true, force: true });
     }
   });
 });
