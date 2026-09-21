@@ -3,7 +3,9 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { join } from 'node:path'
 import { desktopNodeEnvironment } from './node-environment.ts'
-import { NOTIFICATION_OUTCOMES, type NotificationOutcome } from './desktop-contract.ts'
+import type { DesktopNotification } from './desktop-contract.ts'
+import { isDesktopNotification } from './notifications.ts'
+import type { DesktopPermission, DesktopPermissionAction, DesktopPermissionSnapshot } from './permissions.ts'
 
 interface ReadyEvent {
   readonly type: 'ready'
@@ -16,7 +18,7 @@ interface FatalEvent {
   readonly message: string
 }
 
-type DesktopHostEvent = ReadyEvent | FatalEvent | { type: 'notification'; outcome: NotificationOutcome } | { readonly type: 'shutdown-complete' } | { readonly type: 'desktop-action'; readonly action: 'restart' | 'terminal' } | {
+type DesktopHostEvent = ReadyEvent | FatalEvent | { type: 'permission'; requestId: number; action: DesktopPermissionAction; permission: DesktopPermission } | { type: 'browser-access'; requestId: number; error?: string } | { type: 'notification'; notification: DesktopNotification } | { readonly type: 'shutdown-complete' } | { readonly type: 'desktop-action'; readonly action: 'restart' | 'terminal' } | {
   readonly type: 'update-tasks'
   readonly requestId: number
   readonly active: boolean
@@ -36,12 +38,18 @@ function isDesktopHostEvent(message: unknown): message is DesktopHostEvent {
     case 'fatal':
       return typeof candidate.message === 'string'
     case 'notification':
-      return NOTIFICATION_OUTCOMES.includes(candidate.outcome as NotificationOutcome)
+      return isDesktopNotification(candidate.notification)
+    case 'permission':
+      return Number.isSafeInteger(candidate.requestId) && (candidate.requestId as number) > 0
+        && typeof candidate.action === 'string' && ['query', 'request', 'open-settings'].includes(candidate.action)
+        && typeof candidate.permission === 'string' && ['microphone', 'screen', 'accessibility'].includes(candidate.permission)
     case 'desktop-action':
       return candidate.action === 'restart' || candidate.action === 'terminal'
     case 'update-tasks':
       return Number.isSafeInteger(candidate.requestId) && typeof candidate.active === 'boolean'
         && (candidate.error === undefined || typeof candidate.error === 'string')
+    case 'browser-access':
+      return Number.isSafeInteger(candidate.requestId) && (candidate.error === undefined || typeof candidate.error === 'string')
     default:
       return false
   }
@@ -85,6 +93,7 @@ export class DesktopHostProcess {
   private shutdownCompleted = false
   private nextControlId = 1
   private readonly taskQueries = new Map<number, { resolve: (active: boolean) => void; reject: (error: Error) => void }>()
+  private readonly accessRequests = new Map<number, { resolve: () => void; reject: (error: Error) => void }>()
 
   /**
    * @param node - Absolute Electron executable in Node mode.
@@ -110,9 +119,10 @@ export class DesktopHostProcess {
     private readonly packageManager?: { readonly pnpm: string; readonly nodeBin: string },
     private readonly hostEntry?: string,
     private readonly onRestart?: () => void,
-    private readonly onNotification?: (outcome: NotificationOutcome) => void,
+    private readonly onNotification?: (notification: DesktopNotification) => void,
     private readonly onLog?: (chunk: string) => void,
     private readonly onTerminal?: () => void,
+    private readonly onPermission?: (action: DesktopPermissionAction, permission: DesktopPermission) => Promise<DesktopPermissionSnapshot>,
   ) {}
 
   /**
@@ -155,13 +165,27 @@ export class DesktopHostProcess {
       }
       else if (message.type === 'fatal') this.fail(new Error(message.message))
       else if (message.type === 'notification') {
-        if (!this.stopping && !this.failureReported) this.onNotification?.(message.outcome)
+        if (!this.stopping && !this.failureReported) this.onNotification?.(message.notification)
+      }
+      else if (message.type === 'permission') {
+        const reply = (result: object): void => {
+          if (child.connected && !this.stopping && !this.failureReported) child.send({ type: 'permission-result', requestId: message.requestId, ...result }, () => {})
+        }
+        void Promise.resolve().then(() => {
+          if (this.stopping || this.failureReported || !this.onPermission) throw new Error('Desktop permissions are unavailable')
+          return this.onPermission(message.action, message.permission)
+        }).then(snapshot => reply({ snapshot }), () => reply({ error: 'Desktop permissions are unavailable' }))
       }
       else if (message.type === 'desktop-action') {
         if (!this.stopping && !this.failureReported) {
           if (message.action === 'restart') this.onRestart?.()
           else this.onTerminal?.()
         }
+      }
+      else if (message.type === 'browser-access') {
+        const request = this.accessRequests.get(message.requestId)
+        if (message.error === undefined) request?.resolve()
+        else request?.reject(new Error(message.error))
       }
       else {
         const query = this.taskQueries.get(message.requestId)
@@ -179,6 +203,21 @@ export class DesktopHostProcess {
       })
     })
     return this.readyPromise
+  }
+
+  /** Acknowledge the live request gate before publishing browser access as enabled. */
+  async setBrowserAccess(enabled: boolean): Promise<void> {
+    const child = this.child
+    if (!child?.connected || this.stopping || this.failureReported) throw new Error('Next Host is unavailable')
+    const requestId = this.nextControlId++
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.accessRequests.set(requestId, { resolve, reject })
+        timer = setTimeout(() => reject(new Error('Browser access change timed out')), 5_000)
+        child.send({ type: 'browser-access', requestId, enabled }, error => { if (error) reject(error) })
+      })
+    } finally { clearTimeout(timer); this.accessRequests.delete(requestId) }
   }
 
   /**
@@ -237,6 +276,8 @@ export class DesktopHostProcess {
     this.readyReject(error)
     for (const query of this.taskQueries.values()) query.reject(error)
     this.taskQueries.clear()
+    for (const request of this.accessRequests.values()) request.reject(error)
+    this.accessRequests.clear()
     if (!this.failureReported && !this.stopping) {
       this.failureReported = true
       try { this.onFailure?.(error) } catch (listenerError) {
